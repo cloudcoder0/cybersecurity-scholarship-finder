@@ -22,9 +22,10 @@ Automated MVP CLI tool to discover cybersecurity scholarships and grants from **
 ./main discover --query "cybersecurity scholarship grant for women veterans first-generation"
 ./main crawl --limit-sources 10
 ./main profile set --name "Alex" --gpa 3.7 --state CA
-./main match --name "Alex" --limit 15
-./main latest --limit 10
-./main export --out opportunities.json
+./main match --name "Alex" --limit 15 --as-of 2026-04-06
+./main latest --limit 10 --as-of 2026-04-06
+./main export --out opportunities.json --as-of 2026-04-06
+./main prune --as-of 2026-04-06
 ```
 
 ## Interactive mode
@@ -36,4 +37,5 @@ Run with no args:
 ## Notes
 - This is an MVP web crawler. Some sites may block bots, require JS rendering, or have strict robots rules.
 - If `robots.txt` is missing (HTTP 404), crawl is allowed by default; if robots cannot be verified due to network/parsing issues, source is skipped.
+- Expired scholarships are automatically removed after crawl and are filtered out of `latest`, `match`, and `export` using today (or a provided `--as-of YYYY-MM-DD` date).
 - Data extraction is heuristic and should be reviewed before applying.

@@ -141,9 +141,19 @@ SOURCES: list[Source] = [
     # Additional niche sources to exceed MVP 50
     Source("Women in Defense", "association", "https://wid.org"),
     Source("AFCEA", "association", "https://www.afcea.org"),
+    Source("AFCEA Educational Foundation", "association", "https://www.afcea.org/afcea-educational-foundation"),
     Source("NRECA Cooperative Research", "association", "https://www.electric.coop"),
     Source("OpenSSF", "association", "https://openssf.org"),
     Source("Linux Foundation Research", "association", "https://www.linuxfoundation.org"),
+    Source("ISSA Education Foundation", "association", "https://issaef.org/scholarships/"),
+    Source("National Cyber Scholarship Foundation", "association", "https://www.nationalcyberscholarship.org/"),
+    Source("CSA Detroit Chapter Scholarships", "association", "https://www.csadetroit.org/scholarships"),
+    Source("ISACA Chicago Chapter Academic Programs", "association", "https://engage.isaca.org/chicagochapter/programs/academicprograms/new-page"),
+    Source("AFA CyberPatriot", "association", "https://www.afa.org/cyberpatriot/"),
+    Source("NCL (National Cyber League)", "association", "https://nationalcyberleague.org/"),
+    Source("Women in STEM Scholarship Hub", "association", "https://www.womentech.net/women-stem-scholarships"),
+    Source("Blacks In Cybersecurity", "association", "https://www.blacksincyberconf.com/"),
+    Source("Cyversity", "association", "https://www.cyversity.org/"),
 ]
 
 
@@ -236,6 +246,7 @@ def parse_opportunity_details(url: str, text: str, source: Source) -> Optional[d
         plain,
         flags=re.IGNORECASE,
     )
+    due_raw = due_match.group(1) if due_match else "Not listed"
 
     desc = plain[:340] + ("..." if len(plain) > 340 else "")
     req_bits = []
@@ -252,7 +263,8 @@ def parse_opportunity_details(url: str, text: str, source: Source) -> Optional[d
         "description": desc,
         "requirements": requirements,
         "amount": amount_match.group(1) if amount_match else "Not listed",
-        "due_date": due_match.group(1) if due_match else "Not listed",
+        "due_date": due_raw,
+        "deadline_date": normalize_deadline(due_raw),
         "raw_text": plain[:4000],
     }
 
@@ -270,6 +282,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             requirements TEXT NOT NULL,
             amount TEXT NOT NULL,
             due_date TEXT NOT NULL,
+            deadline_date TEXT,
             raw_text TEXT NOT NULL,
             scraped_at TEXT NOT NULL
         )
@@ -296,7 +309,41 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(opportunities)").fetchall()]
+    if "deadline_date" not in cols:
+        conn.execute("ALTER TABLE opportunities ADD COLUMN deadline_date TEXT")
     conn.commit()
+
+
+def normalize_deadline(due_text: str) -> Optional[str]:
+    if not due_text or due_text.lower() == "not listed":
+        return None
+    raw = due_text.strip()
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%m/%d/%Y", "%m/%d/%y"):
+        try:
+            return dt.datetime.strptime(raw, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def parse_as_of_date(value: Optional[str]) -> dt.date:
+    if not value:
+        return dt.date.today()
+    return dt.datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def purge_expired(conn: sqlite3.Connection, as_of: dt.date) -> int:
+    result = conn.execute(
+        """
+        DELETE FROM opportunities
+        WHERE deadline_date IS NOT NULL
+          AND deadline_date < ?
+        """,
+        (as_of.isoformat(),),
+    )
+    conn.commit()
+    return int(result.rowcount or 0)
 
 
 def classify_category(url: str) -> str:
@@ -458,8 +505,8 @@ def save_opportunities(conn: sqlite3.Connection, opportunities: Iterable[dict]) 
         conn.execute(
             """
             INSERT INTO opportunities
-            (source_name, source_category, title, url, description, requirements, amount, due_date, raw_text, scraped_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (source_name, source_category, title, url, description, requirements, amount, due_date, deadline_date, raw_text, scraped_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(url) DO UPDATE SET
                 source_name = excluded.source_name,
                 source_category = excluded.source_category,
@@ -468,12 +515,14 @@ def save_opportunities(conn: sqlite3.Connection, opportunities: Iterable[dict]) 
                 requirements = excluded.requirements,
                 amount = excluded.amount,
                 due_date = excluded.due_date,
+                deadline_date = excluded.deadline_date,
                 raw_text = excluded.raw_text,
                 scraped_at = excluded.scraped_at
             """,
             (
                 op["source_name"], op["source_category"], op["title"], op["url"], op["description"],
-                op["requirements"], op["amount"], op["due_date"], op["raw_text"], dt.datetime.utcnow().isoformat()
+                op["requirements"], op["amount"], op["due_date"], op["deadline_date"],
+                op["raw_text"], dt.datetime.utcnow().isoformat()
             ),
         )
         count += 1
@@ -481,7 +530,9 @@ def save_opportunities(conn: sqlite3.Connection, opportunities: Iterable[dict]) 
     return count
 
 
-def crawl_sources(conn: sqlite3.Connection, limit_sources: Optional[int] = None, delay: float = 0.3) -> None:
+def crawl_sources(
+    conn: sqlite3.Connection, limit_sources: Optional[int] = None, delay: float = 0.3, as_of: Optional[dt.date] = None
+) -> None:
     dynamic_sources = load_discovered_sources(conn)
     combined = SOURCES + dynamic_sources
     sources = combined[:limit_sources] if limit_sources else combined
@@ -523,19 +574,23 @@ def crawl_sources(conn: sqlite3.Connection, limit_sources: Optional[int] = None,
         time.sleep(delay)
 
     saved = save_opportunities(conn, all_found)
+    removed = purge_expired(conn, as_of or dt.date.today())
     print(f"\n[+] Crawl complete. Saved/updated {saved} opportunities.")
+    print(f"[i] Expired opportunities removed: {removed}")
     print(f"[i] Sources skipped for compliance/network reasons: {skipped}")
 
 
-def show_latest(conn: sqlite3.Connection, limit: int = 20) -> None:
+def show_latest(conn: sqlite3.Connection, limit: int = 20, as_of: Optional[dt.date] = None) -> None:
+    cutoff = (as_of or dt.date.today()).isoformat()
     rows = conn.execute(
         """
         SELECT title, source_name, amount, due_date, url
         FROM opportunities
+        WHERE deadline_date IS NULL OR deadline_date >= ?
         ORDER BY scraped_at DESC
         LIMIT ?
         """,
-        (limit,),
+        (cutoff, limit),
     ).fetchall()
     if not rows:
         print("No opportunities found yet. Run crawl first.")
@@ -547,20 +602,23 @@ def show_latest(conn: sqlite3.Connection, limit: int = 20) -> None:
         print(f"    URL: {row[4]}")
 
 
-def run_match(conn: sqlite3.Connection, profile_name: str, limit: int = 20) -> None:
+def run_match(conn: sqlite3.Connection, profile_name: str, limit: int = 20, as_of: Optional[dt.date] = None) -> None:
     profile = get_profile(conn, profile_name)
     if not profile:
         print(f"Profile '{profile_name}' not found. Use 'profile set' first.")
         return
 
+    cutoff = (as_of or dt.date.today()).isoformat()
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         """
         SELECT *
         FROM opportunities
+        WHERE deadline_date IS NULL OR deadline_date >= ?
         ORDER BY scraped_at DESC
         LIMIT 800
-        """
+        """,
+        (cutoff,),
     ).fetchall()
 
     if not rows:
@@ -583,13 +641,16 @@ def run_match(conn: sqlite3.Connection, profile_name: str, limit: int = 20) -> N
         print(f"    URL: {row['url']}")
 
 
-def export_json(conn: sqlite3.Connection, out: Path) -> None:
+def export_json(conn: sqlite3.Connection, out: Path, as_of: Optional[dt.date] = None) -> None:
+    cutoff = (as_of or dt.date.today()).isoformat()
     rows = conn.execute(
         """
         SELECT source_name, source_category, title, url, description, requirements, amount, due_date, scraped_at
         FROM opportunities
+        WHERE deadline_date IS NULL OR deadline_date >= ?
         ORDER BY scraped_at DESC
-        """
+        """,
+        (cutoff,),
     ).fetchall()
     payload = [
         {
@@ -616,6 +677,7 @@ def build_parser() -> argparse.ArgumentParser:
     crawl = sub.add_parser("crawl", help="crawl sources and update DB")
     crawl.add_argument("--limit-sources", type=int, default=None, help="only crawl first N sources")
     crawl.add_argument("--delay", type=float, default=0.2, help="delay between source crawls")
+    crawl.add_argument("--as-of", default=None, help="reference date YYYY-MM-DD for expiry filtering")
 
     discover = sub.add_parser("discover", help="discover new niche sources using web search")
     discover.add_argument(
@@ -635,12 +697,18 @@ def build_parser() -> argparse.ArgumentParser:
     match = sub.add_parser("match", help="match opportunities against a profile")
     match.add_argument("--name", required=True, help="profile name")
     match.add_argument("--limit", type=int, default=20)
+    match.add_argument("--as-of", default=None, help="reference date YYYY-MM-DD for expiry filtering")
 
     latest = sub.add_parser("latest", help="list latest opportunities")
     latest.add_argument("--limit", type=int, default=20)
+    latest.add_argument("--as-of", default=None, help="reference date YYYY-MM-DD for expiry filtering")
 
     export = sub.add_parser("export", help="export opportunities to JSON")
     export.add_argument("--out", default="opportunities.json")
+    export.add_argument("--as-of", default=None, help="reference date YYYY-MM-DD for expiry filtering")
+
+    prune = sub.add_parser("prune", help="remove expired opportunities from the database")
+    prune.add_argument("--as-of", default=None, help="reference date YYYY-MM-DD (default: today)")
 
     sub.add_parser("sources", help="list all configured sources")
 
@@ -662,7 +730,9 @@ def run_interactive(conn: sqlite3.Connection) -> None:
         choice = input("Select > ").strip()
 
         if choice == "1":
-            crawl_sources(conn)
+            as_of_in = input("As-of date [today, YYYY-MM-DD]: ").strip()
+            as_of = parse_as_of_date(as_of_in or None)
+            crawl_sources(conn, as_of=as_of)
         elif choice == "2":
             query = input("Discovery query [cybersecurity scholarship grant]: ").strip() or "cybersecurity scholarship grant"
             found = discover_sources_via_search(conn, query, max_results=40)
@@ -675,16 +745,22 @@ def run_interactive(conn: sqlite3.Connection) -> None:
             print("Profile saved.")
         elif choice == "4":
             name = input("Profile name: ").strip()
-            run_match(conn, name)
+            as_of_in = input("As-of date [today, YYYY-MM-DD]: ").strip()
+            as_of = parse_as_of_date(as_of_in or None)
+            run_match(conn, name, as_of=as_of)
         elif choice == "5":
-            show_latest(conn)
+            as_of_in = input("As-of date [today, YYYY-MM-DD]: ").strip()
+            as_of = parse_as_of_date(as_of_in or None)
+            show_latest(conn, as_of=as_of)
         elif choice == "6":
             all_sources = SOURCES + load_discovered_sources(conn)
             for i, s in enumerate(all_sources, start=1):
                 print(f"{i:02d}. {s.name} [{s.category}] - {s.url}")
         elif choice == "7":
             out = input("Output file [opportunities.json]: ").strip() or "opportunities.json"
-            export_json(conn, Path(out))
+            as_of_in = input("As-of date [today, YYYY-MM-DD]: ").strip()
+            as_of = parse_as_of_date(as_of_in or None)
+            export_json(conn, Path(out), as_of=as_of)
         elif choice == "0":
             print("Good luck with your scholarship hunt.")
             return
@@ -704,7 +780,9 @@ def main() -> int:
         return 0
 
     if args.cmd == "crawl":
-        crawl_sources(conn, limit_sources=args.limit_sources, delay=args.delay)
+        crawl_sources(
+            conn, limit_sources=args.limit_sources, delay=args.delay, as_of=parse_as_of_date(args.as_of)
+        )
     elif args.cmd == "discover":
         found = discover_sources_via_search(conn, args.query, max_results=args.max_results)
         print(f"Discovered/updated {found} sources from query.")
@@ -715,11 +793,14 @@ def main() -> int:
         else:
             parser.error("Invalid profile command")
     elif args.cmd == "match":
-        run_match(conn, args.name, args.limit)
+        run_match(conn, args.name, args.limit, as_of=parse_as_of_date(args.as_of))
     elif args.cmd == "latest":
-        show_latest(conn, args.limit)
+        show_latest(conn, args.limit, as_of=parse_as_of_date(args.as_of))
     elif args.cmd == "export":
-        export_json(conn, Path(args.out))
+        export_json(conn, Path(args.out), as_of=parse_as_of_date(args.as_of))
+    elif args.cmd == "prune":
+        removed = purge_expired(conn, parse_as_of_date(args.as_of))
+        print(f"Removed {removed} expired opportunities.")
     elif args.cmd == "sources":
         all_sources = SOURCES + load_discovered_sources(conn)
         for i, s in enumerate(all_sources, start=1):
