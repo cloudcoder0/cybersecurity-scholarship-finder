@@ -21,7 +21,7 @@ Run with no arguments:
 ```
 
 ## Notes
-- This is an MVP web crawler. Some sites may block bots, require JS rendering, or have strict robots rules.
+- Some sites may block bots, require JS rendering, or have strict robots rules.
 - If `robots.txt` is missing (HTTP 404), crawl is allowed by default; if robots cannot be verified due to network/parsing issues, source is skipped.
 - Expired scholarships are automatically removed after crawl and are filtered out of `latest`, `match`, and `export` using today (or a provided `--as-of YYYY-MM-DD` date).
 - Data extraction is heuristic and should be reviewed before applying.
