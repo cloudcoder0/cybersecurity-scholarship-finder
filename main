@@ -1,1 +1,815 @@
+#!/usr/bin/env python3
+"""
+Cybersecurity Scholarship + Grant Finder (MVP)
 
+Features:
+- Scans 50+ non-traditional sources (gov, libraries, nonprofits, industry groups, conferences, companies)
+- Checks robots.txt before crawling any URL
+- Builds/updates a local SQLite database of opportunities
+- Supports user profiles (name, GPA, state)
+- Matches opportunities to user profile eligibility hints
+- Dynamic CLI with ASCII art banner and simple menu
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import re
+import sqlite3
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Optional
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+from urllib import robotparser
+
+
+DB_PATH = Path("scholarships.db")
+USER_AGENT = "CyberSecScholarshipFinderBot/0.1 (+local-mvp)"
+REQUEST_TIMEOUT = 12
+MAX_LINKS_PER_SOURCE = 40
+MAX_DETAIL_PAGES_PER_SOURCE = 12
+MAX_DISCOVERED_SOURCES = 120
+
+KEYWORDS = (
+    "cybersecurity",
+    "cyber",
+    "information assurance",
+    "infosec",
+    "security",
+    "scholarship",
+    "grant",
+    "fellowship",
+    "stipend",
+)
+
+STATE_ALIASES = {
+    "AL": "ALABAMA", "AK": "ALASKA", "AZ": "ARIZONA", "AR": "ARKANSAS", "CA": "CALIFORNIA",
+    "CO": "COLORADO", "CT": "CONNECTICUT", "DE": "DELAWARE", "FL": "FLORIDA", "GA": "GEORGIA",
+    "HI": "HAWAII", "ID": "IDAHO", "IL": "ILLINOIS", "IN": "INDIANA", "IA": "IOWA",
+    "KS": "KANSAS", "KY": "KENTUCKY", "LA": "LOUISIANA", "ME": "MAINE", "MD": "MARYLAND",
+    "MA": "MASSACHUSETTS", "MI": "MICHIGAN", "MN": "MINNESOTA", "MS": "MISSISSIPPI", "MO": "MISSOURI",
+    "MT": "MONTANA", "NE": "NEBRASKA", "NV": "NEVADA", "NH": "NEW HAMPSHIRE", "NJ": "NEW JERSEY",
+    "NM": "NEW MEXICO", "NY": "NEW YORK", "NC": "NORTH CAROLINA", "ND": "NORTH DAKOTA", "OH": "OHIO",
+    "OK": "OKLAHOMA", "OR": "OREGON", "PA": "PENNSYLVANIA", "RI": "RHODE ISLAND", "SC": "SOUTH CAROLINA",
+    "SD": "SOUTH DAKOTA", "TN": "TENNESSEE", "TX": "TEXAS", "UT": "UTAH", "VT": "VERMONT",
+    "VA": "VIRGINIA", "WA": "WASHINGTON", "WV": "WEST VIRGINIA", "WI": "WISCONSIN", "WY": "WYOMING",
+    "DC": "DISTRICT OF COLUMBIA",
+}
+
+
+@dataclass
+class Source:
+    name: str
+    category: str
+    url: str
+
+
+SOURCES: list[Source] = [
+    # Government / public programs
+    Source("CISA", "government", "https://www.cisa.gov"),
+    Source("NSA CAE", "government", "https://www.nsa.gov/Academics/Centers-of-Academic-Excellence/"),
+    Source("NIST", "government", "https://www.nist.gov"),
+    Source("NSF Scholarships", "government", "https://www.nsf.gov"),
+    Source("DOE STEM", "government", "https://www.energy.gov/stem"),
+    Source("Department of Defense STEM", "government", "https://www.defense.gov/Spotlights/STEM/"),
+    Source("Department of State Exchanges", "government", "https://exchanges.state.gov"),
+    Source("CyberCorps SFS", "government", "https://sfs.opm.gov"),
+    Source("NCAE Program Office", "government", "https://www.caecommunity.org"),
+    Source("SBA Grants", "government", "https://www.sba.gov/funding-programs/grants"),
+
+    # Libraries / public institutions
+    Source("Library of Congress Grants", "library", "https://www.loc.gov/programs/"),
+    Source("IMLS Grants", "library", "https://www.imls.gov/grants"),
+    Source("New York Public Library", "library", "https://www.nypl.org"),
+    Source("Boston Public Library", "library", "https://www.bpl.org"),
+    Source("Seattle Public Library", "library", "https://www.spl.org"),
+
+    # Cybersecurity nonprofits / associations
+    Source("(ISC)2 Scholarships", "nonprofit", "https://www.isc2.org/Development/Scholarships"),
+    Source("ISACA Foundation", "nonprofit", "https://www.isaca.org/foundation"),
+    Source("SANS Cyber Academies", "nonprofit", "https://www.sans.org/cyber-academy/"),
+    Source("Women in CyberSecurity", "nonprofit", "https://www.wicys.org"),
+    Source("NCA", "nonprofit", "https://staysafeonline.org"),
+    Source("InfraGard", "nonprofit", "https://www.infragard.org"),
+    Source("CyberPeace Institute", "nonprofit", "https://cyberpeaceinstitute.org"),
+    Source("Access Now", "nonprofit", "https://www.accessnow.org"),
+    Source("EFF", "nonprofit", "https://www.eff.org"),
+    Source("Internet Society", "nonprofit", "https://www.internetsociety.org"),
+
+    # Industry associations / conferences
+    Source("RSA Conference", "conference", "https://www.rsaconference.com"),
+    Source("Black Hat", "conference", "https://www.blackhat.com"),
+    Source("DEF CON", "conference", "https://defcon.org"),
+    Source("BSides", "conference", "https://bsides.org"),
+    Source("FIRST", "association", "https://www.first.org"),
+    Source("CSA", "association", "https://cloudsecurityalliance.org"),
+    Source("OWASP", "association", "https://owasp.org"),
+    Source("(IAB) Internet Architecture Board", "association", "https://www.iab.org"),
+    Source("USENIX", "association", "https://www.usenix.org"),
+    Source("IEEE Computer Society", "association", "https://www.computer.org"),
+
+    # Corporate / vendor programs
+    Source("Microsoft Security", "company", "https://www.microsoft.com/en-us/security"),
+    Source("Google Security", "company", "https://security.googleblog.com"),
+    Source("AWS Security", "company", "https://aws.amazon.com/security/"),
+    Source("Cisco Security", "company", "https://www.cisco.com/site/us/en/products/security/index.html"),
+    Source("Palo Alto Networks", "company", "https://www.paloaltonetworks.com"),
+    Source("CrowdStrike", "company", "https://www.crowdstrike.com"),
+    Source("Mandiant", "company", "https://www.mandiant.com"),
+    Source("Fortinet Training", "company", "https://www.fortinet.com/training"),
+    Source("Trend Micro", "company", "https://www.trendmicro.com"),
+    Source("Proofpoint", "company", "https://www.proofpoint.com"),
+
+    # Universities / labs / niche orgs
+    Source("CMU CyLab", "academic", "https://www.cylab.cmu.edu"),
+    Source("MITRE", "academic", "https://www.mitre.org"),
+    Source("Johns Hopkins APL", "academic", "https://www.jhuapl.edu"),
+    Source("RIT Security", "academic", "https://www.rit.edu/cybersecurity"),
+    Source("Purdue CERIAS", "academic", "https://www.cerias.purdue.edu"),
+    Source("UC Berkeley CLTC", "academic", "https://cltc.berkeley.edu"),
+    Source("Stanford Cyber Policy", "academic", "https://cyber.fsi.stanford.edu"),
+    Source("Northeastern Cybersecurity", "academic", "https://cybersecurity.northeastern.edu"),
+    Source("NYU Center for Cybersecurity", "academic", "https://cyber.nyu.edu"),
+    Source("Virginia Tech Hume Center", "academic", "https://www.hume.vt.edu"),
+
+    # Additional niche sources to exceed MVP 50
+    Source("Women in Defense", "association", "https://wid.org"),
+    Source("AFCEA", "association", "https://www.afcea.org"),
+    Source("AFCEA Educational Foundation", "association", "https://www.afcea.org/afcea-educational-foundation"),
+    Source("NRECA Cooperative Research", "association", "https://www.electric.coop"),
+    Source("OpenSSF", "association", "https://openssf.org"),
+    Source("Linux Foundation Research", "association", "https://www.linuxfoundation.org"),
+    Source("ISSA Education Foundation", "association", "https://issaef.org/scholarships/"),
+    Source("National Cyber Scholarship Foundation", "association", "https://www.nationalcyberscholarship.org/"),
+    Source("CSA Detroit Chapter Scholarships", "association", "https://www.csadetroit.org/scholarships"),
+    Source("ISACA Chicago Chapter Academic Programs", "association", "https://engage.isaca.org/chicagochapter/programs/academicprograms/new-page"),
+    Source("AFA CyberPatriot", "association", "https://www.afa.org/cyberpatriot/"),
+    Source("NCL (National Cyber League)", "association", "https://nationalcyberleague.org/"),
+    Source("Women in STEM Scholarship Hub", "association", "https://www.womentech.net/women-stem-scholarships"),
+    Source("Blacks In Cybersecurity", "association", "https://www.blacksincyberconf.com/"),
+    Source("Cyversity", "association", "https://www.cyversity.org/"),
+]
+
+
+def banner() -> str:
+    return r"""
+   ______      __              _____                 __         __    _      
+  / ____/_  __/ /_  ___  _____/ ___/_________  _____/ /_  _____/ /_  (_)___  
+ / /   / / / / __ \/ _ \/ ___/\__ \/ ___/ __ \/ ___/ __ \/ ___/ __ \/ / __ \ 
+/ /___/ /_/ / /_/ /  __/ /   ___/ / /__/ /_/ / /  / /_/ (__  ) / / / / /_/ / 
+\____/\__, /_.___/\___/_/   /____/\___/\____/_/  /_.___/____/_/ /_/_/ .___/  
+     /____/                                                          /_/       
+      Scholarship + Grant Finder (MVP, robots.txt-aware)
+"""
+
+
+def fetch_url(url: str) -> Optional[str]:
+    try:
+        req = Request(url, headers={"User-Agent": USER_AGENT})
+        with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            if "text" not in content_type and "json" not in content_type and "xml" not in content_type:
+                return None
+            data = resp.read().decode("utf-8", errors="ignore")
+            return data
+    except (URLError, HTTPError, TimeoutError):
+        return None
+
+
+def fetch_status(url: str) -> Optional[int]:
+    try:
+        req = Request(url, headers={"User-Agent": USER_AGENT}, method="HEAD")
+        with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            return int(resp.status)
+    except HTTPError as err:
+        return int(err.code)
+    except (URLError, TimeoutError):
+        return None
+
+
+def robots_allowed(target_url: str) -> bool:
+    parsed = urlparse(target_url)
+    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+    status = fetch_status(robots_url)
+    if status == 404:
+        # No robots.txt published => crawl is allowed by default.
+        return True
+    if status is None:
+        # Could not verify robots availability; conservative skip.
+        return False
+    rp = robotparser.RobotFileParser()
+    try:
+        rp.set_url(robots_url)
+        rp.read()
+        return rp.can_fetch(USER_AGENT, target_url)
+    except Exception:
+        # Conservative default: if robots can't be retrieved/parsing fails, skip crawling.
+        return False
+
+
+def extract_candidate_links(base_url: str, html: str) -> list[str]:
+    hrefs = re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    links: list[str] = []
+    for href in hrefs:
+        full = urljoin(base_url, href)
+        if not full.startswith("http"):
+            continue
+        low = full.lower()
+        if any(k in low for k in ("scholar", "grant", "fellow", "cyber", "security", "student", "fund")):
+            links.append(full)
+        if len(links) >= MAX_LINKS_PER_SOURCE:
+            break
+    deduped = list(dict.fromkeys(links))
+    return deduped
+
+
+def parse_opportunity_details(url: str, text: str, source: Source) -> Optional[dict]:
+    low = text.lower()
+    if not any(k in low for k in KEYWORDS):
+        return None
+
+    title_match = re.search(r"<title>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
+    title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else url
+
+    plain = re.sub(r"<[^>]+>", " ", text)
+    plain = re.sub(r"\s+", " ", plain).strip()
+
+    amount_match = re.search(r"(\$\s?[0-9][0-9,]*(?:\.[0-9]{2})?)", plain)
+    due_match = re.search(
+        r"((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4})",
+        plain,
+        flags=re.IGNORECASE,
+    )
+    due_raw = due_match.group(1) if due_match else "Not listed"
+
+    desc = plain[:340] + ("..." if len(plain) > 340 else "")
+    req_bits = []
+    for tag in ("gpa", "undergraduate", "graduate", "us citizen", "residen", "women", "veteran"):
+        if tag in low:
+            req_bits.append(tag)
+    requirements = ", ".join(req_bits) if req_bits else "See source for full eligibility"
+
+    return {
+        "source_name": source.name,
+        "source_category": source.category,
+        "title": title[:180],
+        "url": url,
+        "description": desc,
+        "requirements": requirements,
+        "amount": amount_match.group(1) if amount_match else "Not listed",
+        "due_date": due_raw,
+        "deadline_date": normalize_deadline(due_raw),
+        "raw_text": plain[:4000],
+    }
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS opportunities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_name TEXT NOT NULL,
+            source_category TEXT NOT NULL,
+            title TEXT NOT NULL,
+            url TEXT UNIQUE NOT NULL,
+            description TEXT NOT NULL,
+            requirements TEXT NOT NULL,
+            amount TEXT NOT NULL,
+            due_date TEXT NOT NULL,
+            deadline_date TEXT,
+            raw_text TEXT NOT NULL,
+            scraped_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS profiles (
+            name TEXT PRIMARY KEY,
+            gpa REAL NOT NULL,
+            state TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS discovered_sources (
+            domain TEXT PRIMARY KEY,
+            category TEXT NOT NULL,
+            seed_query TEXT NOT NULL,
+            url TEXT NOT NULL,
+            discovered_at TEXT NOT NULL
+        )
+        """
+    )
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(opportunities)").fetchall()]
+    if "deadline_date" not in cols:
+        conn.execute("ALTER TABLE opportunities ADD COLUMN deadline_date TEXT")
+    conn.commit()
+
+
+def normalize_deadline(due_text: str) -> Optional[str]:
+    if not due_text or due_text.lower() == "not listed":
+        return None
+    raw = due_text.strip()
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%m/%d/%Y", "%m/%d/%y"):
+        try:
+            return dt.datetime.strptime(raw, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def parse_as_of_date(value: Optional[str]) -> dt.date:
+    if not value:
+        return dt.date.today()
+    return dt.datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def purge_expired(conn: sqlite3.Connection, as_of: dt.date) -> int:
+    result = conn.execute(
+        """
+        DELETE FROM opportunities
+        WHERE deadline_date IS NOT NULL
+          AND deadline_date < ?
+        """,
+        (as_of.isoformat(),),
+    )
+    conn.commit()
+    return int(result.rowcount or 0)
+
+
+def classify_category(url: str) -> str:
+    domain = urlparse(url).netloc.lower()
+    if ".gov" in domain or ".mil" in domain:
+        return "government"
+    if any(k in domain for k in ("edu", "ac.")):
+        return "academic"
+    if any(k in domain for k in ("org", "foundation", "institute", "association", "society")):
+        return "nonprofit"
+    if any(k in domain for k in ("conf", "summit", "con", "defcon", "rsa", "bsides")):
+        return "conference"
+    return "company"
+
+
+def _extract_ddg_target(href: str) -> Optional[str]:
+    if href.startswith("//"):
+        href = f"https:{href}"
+    if href.startswith("http://") or href.startswith("https://"):
+        parsed_direct = urlparse(href)
+        if "duckduckgo.com" not in parsed_direct.netloc:
+            return href
+        if parsed_direct.path.startswith("/l/"):
+            qs = parse_qs(parsed_direct.query)
+            if "uddg" in qs:
+                return unquote(qs["uddg"][0])
+            return None
+        return None
+    parsed = urlparse(href)
+    if "duckduckgo.com" in parsed.netloc and parsed.path.startswith("/l/"):
+        qs = parse_qs(parsed.query)
+        if "uddg" in qs:
+            return unquote(qs["uddg"][0])
+    return None
+
+
+def discover_sources_via_search(conn: sqlite3.Connection, query: str, max_results: int = 40) -> int:
+    ddg_url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+    html = fetch_url(ddg_url)
+    if not html:
+        return 0
+
+    hrefs = re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    found = 0
+    seen_domains: set[str] = set()
+
+    for href in hrefs:
+        target = _extract_ddg_target(href)
+        if not target:
+            continue
+        parsed = urlparse(target)
+        domain = parsed.netloc.lower().strip()
+        if not domain or "duckduckgo.com" in domain:
+            continue
+        if domain in seen_domains:
+            continue
+        seen_domains.add(domain)
+
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        if not robots_allowed(base_url):
+            continue
+
+        category = classify_category(base_url)
+        conn.execute(
+            """
+            INSERT INTO discovered_sources (domain, category, seed_query, url, discovered_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(domain) DO UPDATE SET
+                category = excluded.category,
+                seed_query = excluded.seed_query,
+                url = excluded.url,
+                discovered_at = excluded.discovered_at
+            """,
+            (domain, category, query, base_url, dt.datetime.utcnow().isoformat()),
+        )
+        found += 1
+        if found >= max_results:
+            break
+
+    conn.commit()
+    return found
+
+
+def load_discovered_sources(conn: sqlite3.Connection, limit: int = MAX_DISCOVERED_SOURCES) -> list[Source]:
+    rows = conn.execute(
+        """
+        SELECT domain, category, url
+        FROM discovered_sources
+        ORDER BY discovered_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [Source(name=f"Discovered: {r[0]}", category=r[1], url=r[2]) for r in rows]
+
+
+def upsert_profile(conn: sqlite3.Connection, name: str, gpa: float, state: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO profiles (name, gpa, state, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            gpa = excluded.gpa,
+            state = excluded.state,
+            updated_at = excluded.updated_at
+        """,
+        (name.strip(), gpa, state.strip().upper(), dt.datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+
+
+def get_profile(conn: sqlite3.Connection, name: str) -> Optional[dict]:
+    row = conn.execute("SELECT name, gpa, state FROM profiles WHERE name = ?", (name.strip(),)).fetchone()
+    if not row:
+        return None
+    return {"name": row[0], "gpa": float(row[1]), "state": row[2]}
+
+
+def score_match(op: sqlite3.Row, profile: dict) -> tuple[int, list[str]]:
+    score = 0
+    reasons: list[str] = []
+
+    blob = f"{op['title']} {op['description']} {op['requirements']} {op['raw_text']}".lower()
+
+    if "cyber" in blob or "information security" in blob or "infosec" in blob:
+        score += 35
+        reasons.append("Cybersecurity focus detected")
+
+    state = profile["state"].upper()
+    full_state = STATE_ALIASES.get(state, state)
+    if state.lower() in blob or full_state.lower() in blob:
+        score += 30
+        reasons.append(f"State match ({state})")
+
+    gpa = profile["gpa"]
+    gpa_req = re.search(r"gpa[^0-9]{0,12}([0-4](?:\.\d{1,2})?)", blob)
+    if gpa_req:
+        required = float(gpa_req.group(1))
+        if gpa >= required:
+            score += 30
+            reasons.append(f"GPA eligible (requires {required})")
+        else:
+            score -= 25
+            reasons.append(f"Below listed GPA requirement ({required})")
+    else:
+        score += 10
+        reasons.append("No GPA requirement detected")
+
+    if "undergraduate" in blob or "graduate" in blob or "student" in blob:
+        score += 10
+        reasons.append("Student-oriented opportunity")
+
+    return score, reasons
+
+
+def save_opportunities(conn: sqlite3.Connection, opportunities: Iterable[dict]) -> int:
+    count = 0
+    for op in opportunities:
+        conn.execute(
+            """
+            INSERT INTO opportunities
+            (source_name, source_category, title, url, description, requirements, amount, due_date, deadline_date, raw_text, scraped_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(url) DO UPDATE SET
+                source_name = excluded.source_name,
+                source_category = excluded.source_category,
+                title = excluded.title,
+                description = excluded.description,
+                requirements = excluded.requirements,
+                amount = excluded.amount,
+                due_date = excluded.due_date,
+                deadline_date = excluded.deadline_date,
+                raw_text = excluded.raw_text,
+                scraped_at = excluded.scraped_at
+            """,
+            (
+                op["source_name"], op["source_category"], op["title"], op["url"], op["description"],
+                op["requirements"], op["amount"], op["due_date"], op["deadline_date"],
+                op["raw_text"], dt.datetime.utcnow().isoformat()
+            ),
+        )
+        count += 1
+    conn.commit()
+    return count
+
+
+def crawl_sources(
+    conn: sqlite3.Connection, limit_sources: Optional[int] = None, delay: float = 0.3, as_of: Optional[dt.date] = None
+) -> None:
+    dynamic_sources = load_discovered_sources(conn)
+    combined = SOURCES + dynamic_sources
+    sources = combined[:limit_sources] if limit_sources else combined
+    all_found: list[dict] = []
+    skipped = 0
+
+    print(f"[+] Starting crawl for {len(sources)} sources "
+          f"({len(SOURCES)} static + {len(dynamic_sources)} discovered)...")
+    for idx, source in enumerate(sources, start=1):
+        print(f"[{idx:02d}/{len(sources)}] {source.name} :: {source.url}")
+
+        if not robots_allowed(source.url):
+            print("    - skipped (robots.txt disallow or unavailable)")
+            skipped += 1
+            continue
+
+        landing = fetch_url(source.url)
+        if not landing:
+            print("    - no readable landing page")
+            continue
+
+        links = extract_candidate_links(source.url, landing)
+        if source.url not in links:
+            links.insert(0, source.url)
+
+        found_for_source = 0
+        for link in links[:MAX_DETAIL_PAGES_PER_SOURCE]:
+            if not robots_allowed(link):
+                continue
+            page = fetch_url(link)
+            if not page:
+                continue
+            parsed = parse_opportunity_details(link, page, source)
+            if parsed:
+                all_found.append(parsed)
+                found_for_source += 1
+
+        print(f"    - opportunities parsed: {found_for_source}")
+        time.sleep(delay)
+
+    saved = save_opportunities(conn, all_found)
+    removed = purge_expired(conn, as_of or dt.date.today())
+    print(f"\n[+] Crawl complete. Saved/updated {saved} opportunities.")
+    print(f"[i] Expired opportunities removed: {removed}")
+    print(f"[i] Sources skipped for compliance/network reasons: {skipped}")
+
+
+def show_latest(conn: sqlite3.Connection, limit: int = 20, as_of: Optional[dt.date] = None) -> None:
+    cutoff = (as_of or dt.date.today()).isoformat()
+    rows = conn.execute(
+        """
+        SELECT title, source_name, amount, due_date, url
+        FROM opportunities
+        WHERE deadline_date IS NULL OR deadline_date >= ?
+        ORDER BY scraped_at DESC
+        LIMIT ?
+        """,
+        (cutoff, limit),
+    ).fetchall()
+    if not rows:
+        print("No opportunities found yet. Run crawl first.")
+        return
+    print("\nLatest opportunities:\n")
+    for i, row in enumerate(rows, start=1):
+        print(f"{i:02d}. {row[0]}")
+        print(f"    Source: {row[1]} | Amount: {row[2]} | Due: {row[3]}")
+        print(f"    URL: {row[4]}")
+
+
+def run_match(conn: sqlite3.Connection, profile_name: str, limit: int = 20, as_of: Optional[dt.date] = None) -> None:
+    profile = get_profile(conn, profile_name)
+    if not profile:
+        print(f"Profile '{profile_name}' not found. Use 'profile set' first.")
+        return
+
+    cutoff = (as_of or dt.date.today()).isoformat()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM opportunities
+        WHERE deadline_date IS NULL OR deadline_date >= ?
+        ORDER BY scraped_at DESC
+        LIMIT 800
+        """,
+        (cutoff,),
+    ).fetchall()
+
+    if not rows:
+        print("No opportunities available. Run crawl first.")
+        return
+
+    scored = []
+    for row in rows:
+        score, reasons = score_match(row, profile)
+        if score >= 20:
+            scored.append((score, reasons, row))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    print(f"\nTop matches for {profile['name']} (GPA {profile['gpa']}, {profile['state']}):\n")
+    for i, (score, reasons, row) in enumerate(scored[:limit], start=1):
+        print(f"{i:02d}. [{score:03d}] {row['title']}")
+        print(f"    Source: {row['source_name']} | Amount: {row['amount']} | Due: {row['due_date']}")
+        print(f"    Requirements: {row['requirements']}")
+        print(f"    Why: {', '.join(reasons)}")
+        print(f"    URL: {row['url']}")
+
+
+def export_json(conn: sqlite3.Connection, out: Path, as_of: Optional[dt.date] = None) -> None:
+    cutoff = (as_of or dt.date.today()).isoformat()
+    rows = conn.execute(
+        """
+        SELECT source_name, source_category, title, url, description, requirements, amount, due_date, scraped_at
+        FROM opportunities
+        WHERE deadline_date IS NULL OR deadline_date >= ?
+        ORDER BY scraped_at DESC
+        """,
+        (cutoff,),
+    ).fetchall()
+    payload = [
+        {
+            "source": r[0],
+            "category": r[1],
+            "title": r[2],
+            "url": r[3],
+            "description": r[4],
+            "requirements": r[5],
+            "amount": r[6],
+            "due_date": r[7],
+            "scraped_at": r[8],
+        }
+        for r in rows
+    ]
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"Exported {len(payload)} opportunities to {out}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Cybersecurity scholarship/grant finder")
+    sub = parser.add_subparsers(dest="cmd")
+
+    crawl = sub.add_parser("crawl", help="crawl sources and update DB")
+    crawl.add_argument("--limit-sources", type=int, default=None, help="only crawl first N sources")
+    crawl.add_argument("--delay", type=float, default=0.2, help="delay between source crawls")
+    crawl.add_argument("--as-of", default=None, help="reference date YYYY-MM-DD for expiry filtering")
+
+    discover = sub.add_parser("discover", help="discover new niche sources using web search")
+    discover.add_argument(
+        "--query",
+        default="cybersecurity scholarship grant fellowship site:org OR site:gov OR site:edu",
+        help="seed discovery query",
+    )
+    discover.add_argument("--max-results", type=int, default=40, help="max source domains to store")
+
+    profile = sub.add_parser("profile", help="create/update user profile")
+    profile_sub = profile.add_subparsers(dest="profile_cmd")
+    pset = profile_sub.add_parser("set", help="set profile values")
+    pset.add_argument("--name", required=True)
+    pset.add_argument("--gpa", required=True, type=float)
+    pset.add_argument("--state", required=True, help="2-letter state code preferred")
+
+    match = sub.add_parser("match", help="match opportunities against a profile")
+    match.add_argument("--name", required=True, help="profile name")
+    match.add_argument("--limit", type=int, default=20)
+    match.add_argument("--as-of", default=None, help="reference date YYYY-MM-DD for expiry filtering")
+
+    latest = sub.add_parser("latest", help="list latest opportunities")
+    latest.add_argument("--limit", type=int, default=20)
+    latest.add_argument("--as-of", default=None, help="reference date YYYY-MM-DD for expiry filtering")
+
+    export = sub.add_parser("export", help="export opportunities to JSON")
+    export.add_argument("--out", default="opportunities.json")
+    export.add_argument("--as-of", default=None, help="reference date YYYY-MM-DD for expiry filtering")
+
+    prune = sub.add_parser("prune", help="remove expired opportunities from the database")
+    prune.add_argument("--as-of", default=None, help="reference date YYYY-MM-DD (default: today)")
+
+    sub.add_parser("sources", help="list all configured sources")
+
+    return parser
+
+
+def run_interactive(conn: sqlite3.Connection) -> None:
+    print(banner())
+    while True:
+        print("\n[ Menu ]")
+        print("1) Crawl sources")
+        print("2) Discover sources (web search)")
+        print("3) Set profile")
+        print("4) Run matching")
+        print("5) Show latest")
+        print("6) List sources")
+        print("7) Export JSON")
+        print("0) Exit")
+        choice = input("Select > ").strip()
+
+        if choice == "1":
+            as_of_in = input("As-of date [today, YYYY-MM-DD]: ").strip()
+            as_of = parse_as_of_date(as_of_in or None)
+            crawl_sources(conn, as_of=as_of)
+        elif choice == "2":
+            query = input("Discovery query [cybersecurity scholarship grant]: ").strip() or "cybersecurity scholarship grant"
+            found = discover_sources_via_search(conn, query, max_results=40)
+            print(f"Discovered/updated {found} sources.")
+        elif choice == "3":
+            name = input("Name: ").strip()
+            gpa = float(input("GPA: ").strip())
+            state = input("State (e.g., CA): ").strip().upper()
+            upsert_profile(conn, name, gpa, state)
+            print("Profile saved.")
+        elif choice == "4":
+            name = input("Profile name: ").strip()
+            as_of_in = input("As-of date [today, YYYY-MM-DD]: ").strip()
+            as_of = parse_as_of_date(as_of_in or None)
+            run_match(conn, name, as_of=as_of)
+        elif choice == "5":
+            as_of_in = input("As-of date [today, YYYY-MM-DD]: ").strip()
+            as_of = parse_as_of_date(as_of_in or None)
+            show_latest(conn, as_of=as_of)
+        elif choice == "6":
+            all_sources = SOURCES + load_discovered_sources(conn)
+            for i, s in enumerate(all_sources, start=1):
+                print(f"{i:02d}. {s.name} [{s.category}] - {s.url}")
+        elif choice == "7":
+            out = input("Output file [opportunities.json]: ").strip() or "opportunities.json"
+            as_of_in = input("As-of date [today, YYYY-MM-DD]: ").strip()
+            as_of = parse_as_of_date(as_of_in or None)
+            export_json(conn, Path(out), as_of=as_of)
+        elif choice == "0":
+            print("Good luck with your scholarship hunt.")
+            return
+        else:
+            print("Invalid choice.")
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    conn = sqlite3.connect(DB_PATH)
+    init_db(conn)
+
+    if not args.cmd:
+        run_interactive(conn)
+        return 0
+
+    if args.cmd == "crawl":
+        crawl_sources(
+            conn, limit_sources=args.limit_sources, delay=args.delay, as_of=parse_as_of_date(args.as_of)
+        )
+    elif args.cmd == "discover":
+        found = discover_sources_via_search(conn, args.query, max_results=args.max_results)
+        print(f"Discovered/updated {found} sources from query.")
+    elif args.cmd == "profile":
+        if args.profile_cmd == "set":
+            upsert_profile(conn, args.name, args.gpa, args.state)
+            print(f"Profile updated for {args.name}.")
+        else:
+            parser.error("Invalid profile command")
+    elif args.cmd == "match":
+        run_match(conn, args.name, args.limit, as_of=parse_as_of_date(args.as_of))
+    elif args.cmd == "latest":
+        show_latest(conn, args.limit, as_of=parse_as_of_date(args.as_of))
+    elif args.cmd == "export":
+        export_json(conn, Path(args.out), as_of=parse_as_of_date(args.as_of))
+    elif args.cmd == "prune":
+        removed = purge_expired(conn, parse_as_of_date(args.as_of))
+        print(f"Removed {removed} expired opportunities.")
+    elif args.cmd == "sources":
+        all_sources = SOURCES + load_discovered_sources(conn)
+        for i, s in enumerate(all_sources, start=1):
+            print(f"{i:02d}. {s.name} [{s.category}] - {s.url}")
+    else:
+        parser.error(f"Unknown command: {args.cmd}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
