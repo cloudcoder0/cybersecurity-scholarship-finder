@@ -5,6 +5,7 @@ Automated MVP CLI tool to discover cybersecurity scholarships and grants from **
 ## Features
 - Robots.txt-aware crawling (skips pages when disallowed/unavailable).
 - Source catalog of 50+ niche sources (avoids traditional scholarship aggregator sites).
+- Dynamic source discovery from web search queries (`discover` command) so your source pool grows over time.
 - Local SQLite persistence (`scholarships.db`).
 - User profiles (`name`, `gpa`, `state`) for matching.
 - Matching score engine for eligibility hints.
@@ -18,6 +19,7 @@ Automated MVP CLI tool to discover cybersecurity scholarships and grants from **
 ## Quick start
 ```bash
 ./main sources
+./main discover --query "cybersecurity scholarship grant for women veterans first-generation"
 ./main crawl --limit-sources 10
 ./main profile set --name "Alex" --gpa 3.7 --state CA
 ./main match --name "Alex" --limit 15
@@ -33,5 +35,5 @@ Run with no args:
 
 ## Notes
 - This is an MVP web crawler. Some sites may block bots, require JS rendering, or have strict robots rules.
-- If robots.txt cannot be fetched/parsed, the crawler defaults to **skip** for compliance.
+- If `robots.txt` is missing (HTTP 404), crawl is allowed by default; if robots cannot be verified due to network/parsing issues, source is skipped.
 - Data extraction is heuristic and should be reviewed before applying.

@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 from urllib import robotparser
@@ -34,6 +34,7 @@ USER_AGENT = "CyberSecScholarshipFinderBot/0.1 (+local-mvp)"
 REQUEST_TIMEOUT = 12
 MAX_LINKS_PER_SOURCE = 40
 MAX_DETAIL_PAGES_PER_SOURCE = 12
+MAX_DISCOVERED_SOURCES = 120
 
 KEYWORDS = (
     "cybersecurity",
@@ -171,9 +172,27 @@ def fetch_url(url: str) -> Optional[str]:
         return None
 
 
+def fetch_status(url: str) -> Optional[int]:
+    try:
+        req = Request(url, headers={"User-Agent": USER_AGENT}, method="HEAD")
+        with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            return int(resp.status)
+    except HTTPError as err:
+        return int(err.code)
+    except (URLError, TimeoutError):
+        return None
+
+
 def robots_allowed(target_url: str) -> bool:
     parsed = urlparse(target_url)
     robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+    status = fetch_status(robots_url)
+    if status == 404:
+        # No robots.txt published => crawl is allowed by default.
+        return True
+    if status is None:
+        # Could not verify robots availability; conservative skip.
+        return False
     rp = robotparser.RobotFileParser()
     try:
         rp.set_url(robots_url)
@@ -266,7 +285,112 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS discovered_sources (
+            domain TEXT PRIMARY KEY,
+            category TEXT NOT NULL,
+            seed_query TEXT NOT NULL,
+            url TEXT NOT NULL,
+            discovered_at TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
+
+
+def classify_category(url: str) -> str:
+    domain = urlparse(url).netloc.lower()
+    if ".gov" in domain or ".mil" in domain:
+        return "government"
+    if any(k in domain for k in ("edu", "ac.")):
+        return "academic"
+    if any(k in domain for k in ("org", "foundation", "institute", "association", "society")):
+        return "nonprofit"
+    if any(k in domain for k in ("conf", "summit", "con", "defcon", "rsa", "bsides")):
+        return "conference"
+    return "company"
+
+
+def _extract_ddg_target(href: str) -> Optional[str]:
+    if href.startswith("//"):
+        href = f"https:{href}"
+    if href.startswith("http://") or href.startswith("https://"):
+        parsed_direct = urlparse(href)
+        if "duckduckgo.com" not in parsed_direct.netloc:
+            return href
+        if parsed_direct.path.startswith("/l/"):
+            qs = parse_qs(parsed_direct.query)
+            if "uddg" in qs:
+                return unquote(qs["uddg"][0])
+            return None
+        return None
+    parsed = urlparse(href)
+    if "duckduckgo.com" in parsed.netloc and parsed.path.startswith("/l/"):
+        qs = parse_qs(parsed.query)
+        if "uddg" in qs:
+            return unquote(qs["uddg"][0])
+    return None
+
+
+def discover_sources_via_search(conn: sqlite3.Connection, query: str, max_results: int = 40) -> int:
+    ddg_url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+    html = fetch_url(ddg_url)
+    if not html:
+        return 0
+
+    hrefs = re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    found = 0
+    seen_domains: set[str] = set()
+
+    for href in hrefs:
+        target = _extract_ddg_target(href)
+        if not target:
+            continue
+        parsed = urlparse(target)
+        domain = parsed.netloc.lower().strip()
+        if not domain or "duckduckgo.com" in domain:
+            continue
+        if domain in seen_domains:
+            continue
+        seen_domains.add(domain)
+
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        if not robots_allowed(base_url):
+            continue
+
+        category = classify_category(base_url)
+        conn.execute(
+            """
+            INSERT INTO discovered_sources (domain, category, seed_query, url, discovered_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(domain) DO UPDATE SET
+                category = excluded.category,
+                seed_query = excluded.seed_query,
+                url = excluded.url,
+                discovered_at = excluded.discovered_at
+            """,
+            (domain, category, query, base_url, dt.datetime.utcnow().isoformat()),
+        )
+        found += 1
+        if found >= max_results:
+            break
+
+    conn.commit()
+    return found
+
+
+def load_discovered_sources(conn: sqlite3.Connection, limit: int = MAX_DISCOVERED_SOURCES) -> list[Source]:
+    rows = conn.execute(
+        """
+        SELECT domain, category, url
+        FROM discovered_sources
+        ORDER BY discovered_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [Source(name=f"Discovered: {r[0]}", category=r[1], url=r[2]) for r in rows]
 
 
 def upsert_profile(conn: sqlite3.Connection, name: str, gpa: float, state: str) -> None:
@@ -358,11 +482,14 @@ def save_opportunities(conn: sqlite3.Connection, opportunities: Iterable[dict]) 
 
 
 def crawl_sources(conn: sqlite3.Connection, limit_sources: Optional[int] = None, delay: float = 0.3) -> None:
-    sources = SOURCES[:limit_sources] if limit_sources else SOURCES
+    dynamic_sources = load_discovered_sources(conn)
+    combined = SOURCES + dynamic_sources
+    sources = combined[:limit_sources] if limit_sources else combined
     all_found: list[dict] = []
     skipped = 0
 
-    print(f"[+] Starting crawl for {len(sources)} sources...")
+    print(f"[+] Starting crawl for {len(sources)} sources "
+          f"({len(SOURCES)} static + {len(dynamic_sources)} discovered)...")
     for idx, source in enumerate(sources, start=1):
         print(f"[{idx:02d}/{len(sources)}] {source.name} :: {source.url}")
 
@@ -490,6 +617,14 @@ def build_parser() -> argparse.ArgumentParser:
     crawl.add_argument("--limit-sources", type=int, default=None, help="only crawl first N sources")
     crawl.add_argument("--delay", type=float, default=0.2, help="delay between source crawls")
 
+    discover = sub.add_parser("discover", help="discover new niche sources using web search")
+    discover.add_argument(
+        "--query",
+        default="cybersecurity scholarship grant fellowship site:org OR site:gov OR site:edu",
+        help="seed discovery query",
+    )
+    discover.add_argument("--max-results", type=int, default=40, help="max source domains to store")
+
     profile = sub.add_parser("profile", help="create/update user profile")
     profile_sub = profile.add_subparsers(dest="profile_cmd")
     pset = profile_sub.add_parser("set", help="set profile values")
@@ -517,31 +652,37 @@ def run_interactive(conn: sqlite3.Connection) -> None:
     while True:
         print("\n[ Menu ]")
         print("1) Crawl sources")
-        print("2) Set profile")
-        print("3) Run matching")
-        print("4) Show latest")
-        print("5) List sources")
-        print("6) Export JSON")
+        print("2) Discover sources (web search)")
+        print("3) Set profile")
+        print("4) Run matching")
+        print("5) Show latest")
+        print("6) List sources")
+        print("7) Export JSON")
         print("0) Exit")
         choice = input("Select > ").strip()
 
         if choice == "1":
             crawl_sources(conn)
         elif choice == "2":
+            query = input("Discovery query [cybersecurity scholarship grant]: ").strip() or "cybersecurity scholarship grant"
+            found = discover_sources_via_search(conn, query, max_results=40)
+            print(f"Discovered/updated {found} sources.")
+        elif choice == "3":
             name = input("Name: ").strip()
             gpa = float(input("GPA: ").strip())
             state = input("State (e.g., CA): ").strip().upper()
             upsert_profile(conn, name, gpa, state)
             print("Profile saved.")
-        elif choice == "3":
+        elif choice == "4":
             name = input("Profile name: ").strip()
             run_match(conn, name)
-        elif choice == "4":
-            show_latest(conn)
         elif choice == "5":
-            for i, s in enumerate(SOURCES, start=1):
-                print(f"{i:02d}. {s.name} [{s.category}] - {s.url}")
+            show_latest(conn)
         elif choice == "6":
+            all_sources = SOURCES + load_discovered_sources(conn)
+            for i, s in enumerate(all_sources, start=1):
+                print(f"{i:02d}. {s.name} [{s.category}] - {s.url}")
+        elif choice == "7":
             out = input("Output file [opportunities.json]: ").strip() or "opportunities.json"
             export_json(conn, Path(out))
         elif choice == "0":
@@ -564,6 +705,9 @@ def main() -> int:
 
     if args.cmd == "crawl":
         crawl_sources(conn, limit_sources=args.limit_sources, delay=args.delay)
+    elif args.cmd == "discover":
+        found = discover_sources_via_search(conn, args.query, max_results=args.max_results)
+        print(f"Discovered/updated {found} sources from query.")
     elif args.cmd == "profile":
         if args.profile_cmd == "set":
             upsert_profile(conn, args.name, args.gpa, args.state)
@@ -577,7 +721,8 @@ def main() -> int:
     elif args.cmd == "export":
         export_json(conn, Path(args.out))
     elif args.cmd == "sources":
-        for i, s in enumerate(SOURCES, start=1):
+        all_sources = SOURCES + load_discovered_sources(conn)
+        for i, s in enumerate(all_sources, start=1):
             print(f"{i:02d}. {s.name} [{s.category}] - {s.url}")
     else:
         parser.error(f"Unknown command: {args.cmd}")
