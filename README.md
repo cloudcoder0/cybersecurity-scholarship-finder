@@ -1,4 +1,3 @@
-# cybersecurity-scholarship-finder
 ## ABSTRACT: 
 This is a CLI-based web scraper that combines dynamic scraping with 50+ hard coded sources to parse and return cybersecurity based scholarships to the user. It's designed to be used in a Linux environment. This project allows you to set and create a profile based on name, GPA, and state to find scholarships where you meet the requirements. The dynamic web scraper works by utilizing the discover argument to run a search query for whatever you want to expand your potential pool of scholarships, and the crawl argument scrapes potential scholarships from parsed URLs. The discover argument is optional, and if you don't want to use it you can just run crawl to utilize the pre-installed sources. This tool also undergoes legal compliance with robots.txt policies to ensure no illegal activity is being done.
 
